@@ -21,11 +21,11 @@ from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     Placements,
     PrefetchOrder,
     RuntimePolicy,
     SchedulePolicy,
-    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -136,7 +136,13 @@ def _train_fused_wgrad_model(model, context, optimizer, microbatches, set_to_non
     for _ in range(5):
         optimizer.zero_grad(set_to_none=set_to_none)
         for index, (x, target) in enumerate(microbatches):
-            with finalize_gradients(context, enabled=index == len(microbatches) - 1):
+            with context.finalize_gradients(
+                mode=(
+                    GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+                    if index == len(microbatches) - 1
+                    else GradientFinalizationMode.SKIP_OUTER
+                )
+            ):
                 loss = torch.nn.functional.mse_loss(model(x).float(), target)
                 losses.append(loss.detach())
                 (loss / len(microbatches)).backward()
@@ -314,7 +320,9 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
     # that ran before backward_dw() would change the gradient.
     for layer in (fused, copied):
         with fully_shard_context(
-            FsdpContext(device=device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True))
+            FsdpContext(
+                device=device, gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER
+            )
         ):
             fully_shard(layer, mesh=mesh, placements=_default_placements(), grad_scale=0.5)
 
@@ -374,7 +382,11 @@ def test_fused_wgrad_accumulates_across_uses_and_backward_calls(distributed_setu
         with torch.no_grad():
             nn.init.normal_(layer.weight, std=16**-0.5)
         # Registration order has the layer once; execution calls it twice.
-        with fully_shard_context(FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)):
+        with fully_shard_context(
+            FsdpContext(
+                device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+            )
+        ):
             fully_shard(layer, mesh=mesh, placements=_default_placements(), grad_scale=0.5)
         for _ in range(2):
             layer(layer(x)).square().sum().backward()
@@ -472,11 +484,19 @@ def _fused_linear_stack(
     with torch.no_grad():
         for layer in model:
             nn.init.normal_(layer.weight, std=16**-0.5)
-    runtime_policy = RuntimePolicy(
-        overlap_allgather_reduction=overlap_allgather_reduction,
-        caller_managed_grad_sync=caller_managed_grad_sync,
+    runtime_policy = RuntimePolicy(overlap_allgather_reduction=overlap_allgather_reduction)
+    gradient_finalization_mode = (
+        GradientFinalizationMode.REDUCE_OUTER
+        if caller_managed_grad_sync
+        else GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
     )
-    with fully_shard_context(FsdpContext(device=device, runtime_policy=runtime_policy)) as context:
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            runtime_policy=runtime_policy,
+            gradient_finalization_mode=gradient_finalization_mode,
+        )
+    ) as context:
         for layer in model:
             fully_shard(
                 layer, mesh=mesh, placements=_default_placements(), schedule_policy=schedule_policy

@@ -18,6 +18,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     Placements,
     PrefetchOrder,
     RuntimePolicy,
@@ -86,7 +87,11 @@ def test_shared_layer_releases_storage(distributed_setup):
     layer = nn.Linear(4, 4, bias=False, device=device)
     nn.init.ones_(layer.weight)
     model = nn.Sequential(layer, layer)
-    with fully_shard_context(FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)):
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+        )
+    ):
         fully_shard(layer, mesh, _default_placements())
 
     completions = []
@@ -440,7 +445,11 @@ def test_fused_wgrad_releases_buffers(distributed_setup, caller_managed_grad_syn
     with fully_shard_context(
         FsdpContext(
             device=device,
-            runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed_grad_sync),
+            gradient_finalization_mode=(
+                GradientFinalizationMode.REDUCE_OUTER
+                if caller_managed_grad_sync
+                else GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+            ),
         )
     ) as context:
         for layer in model:
